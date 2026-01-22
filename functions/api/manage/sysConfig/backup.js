@@ -23,7 +23,9 @@ export async function onRequest(context) {
             case 'backup':
                 return await handleBackup(context);
             case 'restore':
-                return await handleRestore(request, env);
+                return await handleRestoreAsync(context);
+            case 'restore-status':
+                return await handleRestoreStatus(context);
             default:
                 return new Response(JSON.stringify({ error: '不支持的操作' }), {
                     status: 400,
@@ -155,74 +157,201 @@ async function parseBackupPayload(request) {
     throw new Error('unsupported content-type: ' + contentType);
 }
 
-async function handleRestore(request, env) {
-    try {
-        const db = getDatabase(env);
+const RESTORE_TASK_PREFIX = 'manage@sysConfig@restoreTask@'
+const RESTORE_PROGRESS_INTERVAL = 50
 
-        let backupData;
+function buildRestoreTaskKey(taskId) {
+    return `${RESTORE_TASK_PREFIX}${taskId}`
+}
+
+function calcRestoreProgress(task) {
+    const total = (task.totalFiles || 0) + (task.totalSettings || 0)
+    const done = (task.restoredFiles || 0) + (task.restoredSettings || 0) + (task.failedFiles || 0) + (task.failedSettings || 0)
+    return total > 0 ? Math.floor((done / total) * 100) : 100
+}
+
+function createRestoreTask(taskId, backupData) {
+    const totalFiles = Object.keys(backupData.data?.files || {}).length
+    const totalSettings = Object.keys(backupData.data?.settings || {}).length
+    return {
+        id: taskId,
+        status: 'queued',
+        message: 'queued',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        progress: 0,
+        totalFiles,
+        totalSettings,
+        restoredFiles: 0,
+        restoredSettings: 0,
+        failedFiles: 0,
+        failedSettings: 0,
+        lastError: null,
+        backupTimestamp: backupData.timestamp || null
+    }
+}
+
+async function saveRestoreTask(db, taskKey, task) {
+    task.updatedAt = Date.now()
+    task.progress = calcRestoreProgress(task)
+    await db.put(taskKey, JSON.stringify(task))
+}
+
+async function loadRestoreTask(db, taskKey) {
+    const raw = await db.get(taskKey)
+    return raw ? JSON.parse(raw) : null
+}
+
+async function handleRestoreStatus(context) {
+    const { request, env } = context
+    const url = new URL(request.url)
+    const taskId = url.searchParams.get('taskId')
+
+    if (!taskId) {
+        return new Response(JSON.stringify({ error: 'taskId is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        })
+    }
+
+    const db = getDatabase(env)
+    const taskKey = buildRestoreTaskKey(taskId)
+    const task = await loadRestoreTask(db, taskKey)
+
+    if (!task) {
+        return new Response(JSON.stringify({ error: 'task not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        })
+    }
+
+    return new Response(JSON.stringify({ success: true, task }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    })
+}
+
+async function runRestoreTask(env, taskKey, backupData) {
+    const db = getDatabase(env)
+    let task = await loadRestoreTask(db, taskKey)
+
+    if (!task) {
+        task = createRestoreTask(taskKey.replace(RESTORE_TASK_PREFIX, ''), backupData)
+    }
+
+    task.status = 'running'
+    task.message = 'running'
+    await saveRestoreTask(db, taskKey, task)
+
+    try {
+        const fileEntries = Object.entries(backupData.data?.files || {})
+        let processed = 0
+
+        for (const [key, fileData] of fileEntries) {
+            try {
+                if (fileData?.value) {
+                    await db.put(key, fileData.value, { metadata: fileData.metadata })
+                } else if (fileData?.metadata) {
+                    await db.put(key, '', { metadata: fileData.metadata })
+                }
+                task.restoredFiles++
+            } catch (error) {
+                task.failedFiles++
+                task.lastError = error.message
+                console.error(`Restore file ${key} failed:`, error)
+            }
+
+            processed++
+            if (processed % RESTORE_PROGRESS_INTERVAL === 0) {
+                await saveRestoreTask(db, taskKey, task)
+            }
+        }
+
+        const settingEntries = Object.entries(backupData.data?.settings || {})
+        for (const [key, value] of settingEntries) {
+            try {
+                await db.put(key, value)
+                task.restoredSettings++
+            } catch (error) {
+                task.failedSettings++
+                task.lastError = error.message
+                console.error(`Restore setting ${key} failed:`, error)
+            }
+
+            processed++
+            if (processed % RESTORE_PROGRESS_INTERVAL === 0) {
+                await saveRestoreTask(db, taskKey, task)
+            }
+        }
+
+        if (task.failedFiles > 0 || task.failedSettings > 0) {
+            task.status = 'completed_with_errors'
+            task.message = 'completed with errors'
+        } else {
+            task.status = 'completed'
+            task.message = 'completed'
+        }
+
+        await saveRestoreTask(db, taskKey, task)
+    } catch (error) {
+        task.status = 'failed'
+        task.message = 'failed'
+        task.lastError = error.message
+        await saveRestoreTask(db, taskKey, task)
+        throw error
+    }
+}
+
+async function handleRestoreAsync(context) {
+    const { request, env } = context
+
+    try {
+        let backupData
         try {
-            backupData = await parseBackupPayload(request);
+            backupData = await parseBackupPayload(request)
         } catch (parseError) {
             return new Response(JSON.stringify({ error: 'Invalid backup JSON: ' + parseError.message }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
+            })
         }
 
-        // 验证备份文件格式
         if (!backupData.data || !backupData.data.files || !backupData.data.settings) {
-            return new Response(JSON.stringify({ error: '备份文件格式无效' }), {
+            return new Response(JSON.stringify({ error: 'Invalid backup schema' }), {
                 status: 400,
                 headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
+            })
         }
 
-        let restoredFiles = 0;
-        let restoredSettings = 0;
+        const taskId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+        const taskKey = buildRestoreTaskKey(taskId)
+        const db = getDatabase(env)
+        const task = createRestoreTask(taskId, backupData)
 
-        // 恢复文件数据
-        for (const [key, fileData] of Object.entries(backupData.data.files)) {
-            try {
-                if (fileData.value) {
-                    // 对于有value的文件（如telegram分块文件），恢复完整数据
-                    await db.put(key, fileData.value, {
-                        metadata: fileData.metadata
-                    });
-                } else if (fileData.metadata) {
-                    // 只恢复元数据
-                    await db.put(key, '', {
-                        metadata: fileData.metadata
-                    });
-                }
-                restoredFiles++;
-            } catch (error) {
-                console.error(`恢复文件 ${key} 失败:`, error);
-            }
-        }
+        await saveRestoreTask(db, taskKey, task)
 
-        // 恢复系统设置
-        for (const [key, value] of Object.entries(backupData.data.settings)) {
-            try {
-                await db.put(key, value);
-                restoredSettings++;
-            } catch (error) {
-                console.error(`恢复设置 ${key} 失败:`, error);
-            }
+        const runner = runRestoreTask(env, taskKey, backupData)
+        if (typeof context.waitUntil === 'function') {
+            context.waitUntil(runner)
+        } else {
+            runner.catch((error) => {
+                console.error('Restore task failed:', error)
+            })
         }
 
         return new Response(JSON.stringify({
             success: true,
-            message: '恢复完成',
+            message: 'restore started',
+            taskId,
             stats: {
-                restoredFiles,
-                restoredSettings,
-                backupTimestamp: backupData.timestamp
+                totalFiles: task.totalFiles,
+                totalSettings: task.totalSettings
             }
         }), {
-            status: 200,
+            status: 202,
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
-        });
+        })
     } catch (error) {
-        throw new Error('恢复失败: ' + error.message);
+        throw new Error('Restore failed: ' + error.message)
     }
 }
