@@ -1,10 +1,21 @@
 import { readIndex } from '../../../utils/indexManager.js';
 import { getDatabase } from '../../../utils/databaseAdapter.js';
 
+const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+};
+
 export async function onRequest(context) {
     const { request, env } = context;
 
     try {
+        if (request.method === 'OPTIONS') {
+            return new Response(null, { status: 204, headers: corsHeaders });
+        }
+
         const url = new URL(request.url);
         const action = url.searchParams.get('action');
 
@@ -16,14 +27,14 @@ export async function onRequest(context) {
             default:
                 return new Response(JSON.stringify({ error: '不支持的操作' }), {
                     status: 400,
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 'Content-Type': 'application/json', ...corsHeaders }
                 });
         }
     } catch (error) {
         console.error('备份操作错误:', error);
         return new Response(JSON.stringify({ error: '操作失败: ' + error.message }), {
             status: 500,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
     }
 }
@@ -44,11 +55,11 @@ async function handleBackup(context) {
             }
         };
 
-        // 首先从索引中读取所有文件信息
+        // 首先从索引中读取所有文件信�?
         const indexResult = await readIndex(context, {
-            count: -1,  // 获取所有文件
+            count: -1,  // 获取所有文�?
             start: 0,
-            includeSubdirFiles: true  // 包含子目录下的文件
+            includeSubdirFiles: true  // 包含子目录下的文�?
         });
         backupData.data.fileCount = indexResult.files.length;
 
@@ -57,7 +68,7 @@ async function handleBackup(context) {
             const fileId = file.id;
             const metadata = file.metadata;
 
-            // 对于TelegramNew渠道且IsChunked为true的文件，需要从数据库读取其值
+            // 对于TelegramNew渠道且IsChunked为true的文件，需要从数据库读取其�?
             if (metadata.Channel === 'TelegramNew' && metadata.IsChunked === true) {
                 try {
                     const fileData = await db.getWithMetadata(fileId);
@@ -74,7 +85,7 @@ async function handleBackup(context) {
                     };
                 }
             } else {
-                // 其他文件直接保存索引中的元数据
+                // 其他文件直接保存索引中的元数�?
                 backupData.data.files[fileId] = {
                     metadata: metadata,
                     value: null
@@ -100,7 +111,8 @@ async function handleBackup(context) {
             status: 200,
             headers: {
                 'Content-Type': 'application/json',
-                'Content-Disposition': `attachment; filename="imgbed_backup_${new Date().toISOString().split('T')[0]}.json"`
+                'Content-Disposition': `attachment; filename="imgbed_backup_${new Date().toISOString().split('T')[0]}.json"`,
+                ...corsHeaders
             }
         });
     } catch (error) {
@@ -109,26 +121,59 @@ async function handleBackup(context) {
 }
 
 // 处理恢复操作
+async function parseBackupPayload(request) {
+    const contentType = request.headers.get('content-type') || '';
+
+    if (contentType.includes('application/json')) {
+        return await request.json();
+    }
+
+    if (contentType.includes('multipart/form-data')) {
+        const formData = await request.formData();
+        let file = null;
+
+        for (const value of formData.values()) {
+            if (value && typeof value === 'object' && typeof value.text === 'function') {
+                file = value;
+                break;
+            }
+        }
+
+        if (!file) {
+            throw new Error('backup file not found in form data');
+        }
+
+        const text = await file.text();
+        return JSON.parse(text);
+    }
+
+    if (contentType.includes('text/plain')) {
+        const text = await request.text();
+        return JSON.parse(text);
+    }
+
+    throw new Error('unsupported content-type: ' + contentType);
+}
+
 async function handleRestore(request, env) {
     try {
         const db = getDatabase(env);
 
-        const contentType = request.headers.get('content-type');
-
-        if (!contentType || !contentType.includes('application/json')) {
-            return new Response(JSON.stringify({ error: '请上传JSON格式的备份文件' }), {
+        let backupData;
+        try {
+            backupData = await parseBackupPayload(request);
+        } catch (parseError) {
+            return new Response(JSON.stringify({ error: 'Invalid backup JSON: ' + parseError.message }), {
                 status: 400,
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
         }
-
-        const backupData = await request.json();
 
         // 验证备份文件格式
         if (!backupData.data || !backupData.data.files || !backupData.data.settings) {
             return new Response(JSON.stringify({ error: '备份文件格式无效' }), {
                 status: 400,
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
         }
 
@@ -175,7 +220,7 @@ async function handleRestore(request, env) {
             }
         }), {
             status: 200,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
     } catch (error) {
         throw new Error('恢复失败: ' + error.message);
