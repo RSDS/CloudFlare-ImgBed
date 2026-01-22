@@ -158,10 +158,16 @@ async function parseBackupPayload(request) {
 }
 
 const RESTORE_TASK_PREFIX = 'manage@sysConfig@restoreTask@'
-const RESTORE_PROGRESS_INTERVAL = 50
+const RESTORE_DATA_PREFIX = 'manage@sysConfig@restoreData@'
+const RESTORE_PROGRESS_INTERVAL = 20
+const RESTORE_CHUNK_SIZE = 20
 
 function buildRestoreTaskKey(taskId) {
     return `${RESTORE_TASK_PREFIX}${taskId}`
+}
+
+function buildRestoreDataKey(taskId, type, chunkIndex) {
+    return `${RESTORE_DATA_PREFIX}${taskId}@${type}@${chunkIndex}`
 }
 
 function calcRestoreProgress(task) {
@@ -170,9 +176,7 @@ function calcRestoreProgress(task) {
     return total > 0 ? Math.floor((done / total) * 100) : 100
 }
 
-function createRestoreTask(taskId, backupData) {
-    const totalFiles = Object.keys(backupData.data?.files || {}).length
-    const totalSettings = Object.keys(backupData.data?.settings || {}).length
+function createRestoreTask(taskId, totals, backupTimestamp) {
     return {
         id: taskId,
         status: 'queued',
@@ -180,15 +184,32 @@ function createRestoreTask(taskId, backupData) {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         progress: 0,
-        totalFiles,
-        totalSettings,
+        totalFiles: totals.totalFiles || 0,
+        totalSettings: totals.totalSettings || 0,
+        fileChunks: totals.fileChunks || 0,
+        settingChunks: totals.settingChunks || 0,
         restoredFiles: 0,
         restoredSettings: 0,
         failedFiles: 0,
         failedSettings: 0,
         lastError: null,
-        backupTimestamp: backupData.timestamp || null
+        backupTimestamp: backupTimestamp || null,
+        cursor: {
+            phase: 'files',
+            chunkIndex: 0,
+            index: 0
+        }
     }
+}
+
+function normalizeRestoreCursor(task) {
+    if (!task.cursor) {
+        task.cursor = { phase: 'files', chunkIndex: 0, index: 0 }
+        return
+    }
+    if (!task.cursor.phase) task.cursor.phase = 'files'
+    if (typeof task.cursor.chunkIndex !== 'number') task.cursor.chunkIndex = 0
+    if (typeof task.cursor.index !== 'number') task.cursor.index = 0
 }
 
 async function saveRestoreTask(db, taskKey, task) {
@@ -200,6 +221,181 @@ async function saveRestoreTask(db, taskKey, task) {
 async function loadRestoreTask(db, taskKey) {
     const raw = await db.get(taskKey)
     return raw ? JSON.parse(raw) : null
+}
+
+function chunkEntries(entries, size) {
+    const chunks = []
+    for (let i = 0; i < entries.length; i += size) {
+        chunks.push(entries.slice(i, i + size))
+    }
+    return chunks
+}
+
+async function storeRestoreData(db, taskId, backupData) {
+    const fileEntries = Object.entries(backupData.data?.files || {})
+    const settingEntries = Object.entries(backupData.data?.settings || {})
+
+    const fileChunks = chunkEntries(fileEntries, RESTORE_CHUNK_SIZE)
+    const settingChunks = chunkEntries(settingEntries, RESTORE_CHUNK_SIZE)
+
+    for (let i = 0; i < fileChunks.length; i++) {
+        await db.put(buildRestoreDataKey(taskId, 'files', i), JSON.stringify(fileChunks[i]))
+    }
+
+    for (let i = 0; i < settingChunks.length; i++) {
+        await db.put(buildRestoreDataKey(taskId, 'settings', i), JSON.stringify(settingChunks[i]))
+    }
+
+    return {
+        totalFiles: fileEntries.length,
+        totalSettings: settingEntries.length,
+        fileChunks: fileChunks.length,
+        settingChunks: settingChunks.length
+    }
+}
+
+async function loadRestoreChunk(db, taskId, type, chunkIndex) {
+    const raw = await db.get(buildRestoreDataKey(taskId, type, chunkIndex))
+    return raw ? JSON.parse(raw) : []
+}
+
+async function deleteRestoreChunks(db, task) {
+    if (task.fileChunks) {
+        for (let i = 0; i < task.fileChunks; i++) {
+            await db.delete(buildRestoreDataKey(task.id, 'files', i))
+        }
+    }
+    if (task.settingChunks) {
+        for (let i = 0; i < task.settingChunks; i++) {
+            await db.delete(buildRestoreDataKey(task.id, 'settings', i))
+        }
+    }
+}
+
+async function restoreFileEntry(db, key, fileData, task) {
+    try {
+        if (fileData?.value) {
+            await db.put(key, fileData.value, { metadata: fileData.metadata })
+        } else if (fileData?.metadata) {
+            await db.put(key, '', { metadata: fileData.metadata })
+        }
+        task.restoredFiles++
+    } catch (error) {
+        task.failedFiles++
+        task.lastError = error.message
+        console.error(`Restore file ${key} failed:`, error)
+    }
+}
+
+async function restoreSettingEntry(db, key, value, task) {
+    try {
+        await db.put(key, value)
+        task.restoredSettings++
+    } catch (error) {
+        task.failedSettings++
+        task.lastError = error.message
+        console.error(`Restore setting ${key} failed:`, error)
+    }
+}
+
+async function advanceRestoreTask(db, taskKey, task) {
+    normalizeRestoreCursor(task)
+
+    if (task.status !== 'running') {
+        task.status = 'running'
+        task.message = 'running'
+    }
+
+    if (!task.fileChunks && !task.settingChunks) {
+        await saveRestoreTask(db, taskKey, task)
+        return task
+    }
+
+    let processed = 0
+
+    while (processed < RESTORE_PROGRESS_INTERVAL) {
+        if (task.cursor.phase === 'files') {
+            if (!task.fileChunks || task.cursor.chunkIndex >= task.fileChunks) {
+                task.cursor.phase = 'settings'
+                task.cursor.chunkIndex = 0
+                task.cursor.index = 0
+                continue
+            }
+
+            const chunk = await loadRestoreChunk(db, task.id, 'files', task.cursor.chunkIndex)
+            while (task.cursor.index < chunk.length && processed < RESTORE_PROGRESS_INTERVAL) {
+                const entry = chunk[task.cursor.index] || []
+                const key = entry[0]
+                const fileData = entry[1]
+                if (key) {
+                    await restoreFileEntry(db, key, fileData, task)
+                }
+                task.cursor.index++
+                processed++
+            }
+
+            if (task.cursor.index >= chunk.length) {
+                task.cursor.chunkIndex++
+                task.cursor.index = 0
+            }
+
+            if (processed >= RESTORE_PROGRESS_INTERVAL) {
+                break
+            }
+            continue
+        }
+
+        if (task.cursor.phase === 'settings') {
+            if (!task.settingChunks || task.cursor.chunkIndex >= task.settingChunks) {
+                break
+            }
+
+            const chunk = await loadRestoreChunk(db, task.id, 'settings', task.cursor.chunkIndex)
+            while (task.cursor.index < chunk.length && processed < RESTORE_PROGRESS_INTERVAL) {
+                const entry = chunk[task.cursor.index] || []
+                const key = entry[0]
+                const value = entry[1]
+                if (key) {
+                    await restoreSettingEntry(db, key, value, task)
+                }
+                task.cursor.index++
+                processed++
+            }
+
+            if (task.cursor.index >= chunk.length) {
+                task.cursor.chunkIndex++
+                task.cursor.index = 0
+            }
+
+            if (processed >= RESTORE_PROGRESS_INTERVAL) {
+                break
+            }
+            continue
+        }
+
+        task.cursor.phase = 'settings'
+        task.cursor.chunkIndex = 0
+        task.cursor.index = 0
+    }
+
+    const filesDone = (task.restoredFiles + task.failedFiles) >= (task.totalFiles || 0)
+    const settingsDone = (task.restoredSettings + task.failedSettings) >= (task.totalSettings || 0)
+
+    if (filesDone && settingsDone) {
+        if (task.failedFiles > 0 || task.failedSettings > 0) {
+            task.status = 'completed_with_errors'
+            task.message = 'completed with errors'
+        } else {
+            task.status = 'completed'
+            task.message = 'completed'
+        }
+        await saveRestoreTask(db, taskKey, task)
+        await deleteRestoreChunks(db, task)
+        return task
+    }
+
+    await saveRestoreTask(db, taskKey, task)
+    return task
 }
 
 async function handleRestoreStatus(context) {
@@ -216,7 +412,7 @@ async function handleRestoreStatus(context) {
 
     const db = getDatabase(env)
     const taskKey = buildRestoreTaskKey(taskId)
-    const task = await loadRestoreTask(db, taskKey)
+    let task = await loadRestoreTask(db, taskKey)
 
     if (!task) {
         return new Response(JSON.stringify({ error: 'task not found' }), {
@@ -225,81 +421,14 @@ async function handleRestoreStatus(context) {
         })
     }
 
+    if (task.status === 'queued' || task.status === 'running') {
+        task = await advanceRestoreTask(db, taskKey, task)
+    }
+
     return new Response(JSON.stringify({ success: true, task }), {
         status: 200,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
     })
-}
-
-async function runRestoreTask(env, taskKey, backupData) {
-    const db = getDatabase(env)
-    let task = await loadRestoreTask(db, taskKey)
-
-    if (!task) {
-        task = createRestoreTask(taskKey.replace(RESTORE_TASK_PREFIX, ''), backupData)
-    }
-
-    task.status = 'running'
-    task.message = 'running'
-    await saveRestoreTask(db, taskKey, task)
-
-    try {
-        const fileEntries = Object.entries(backupData.data?.files || {})
-        let processed = 0
-
-        for (const [key, fileData] of fileEntries) {
-            try {
-                if (fileData?.value) {
-                    await db.put(key, fileData.value, { metadata: fileData.metadata })
-                } else if (fileData?.metadata) {
-                    await db.put(key, '', { metadata: fileData.metadata })
-                }
-                task.restoredFiles++
-            } catch (error) {
-                task.failedFiles++
-                task.lastError = error.message
-                console.error(`Restore file ${key} failed:`, error)
-            }
-
-            processed++
-            if (processed % RESTORE_PROGRESS_INTERVAL === 0) {
-                await saveRestoreTask(db, taskKey, task)
-            }
-        }
-
-        const settingEntries = Object.entries(backupData.data?.settings || {})
-        for (const [key, value] of settingEntries) {
-            try {
-                await db.put(key, value)
-                task.restoredSettings++
-            } catch (error) {
-                task.failedSettings++
-                task.lastError = error.message
-                console.error(`Restore setting ${key} failed:`, error)
-            }
-
-            processed++
-            if (processed % RESTORE_PROGRESS_INTERVAL === 0) {
-                await saveRestoreTask(db, taskKey, task)
-            }
-        }
-
-        if (task.failedFiles > 0 || task.failedSettings > 0) {
-            task.status = 'completed_with_errors'
-            task.message = 'completed with errors'
-        } else {
-            task.status = 'completed'
-            task.message = 'completed'
-        }
-
-        await saveRestoreTask(db, taskKey, task)
-    } catch (error) {
-        task.status = 'failed'
-        task.message = 'failed'
-        task.lastError = error.message
-        await saveRestoreTask(db, taskKey, task)
-        throw error
-    }
 }
 
 async function handleRestoreAsync(context) {
@@ -326,18 +455,19 @@ async function handleRestoreAsync(context) {
         const taskId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
         const taskKey = buildRestoreTaskKey(taskId)
         const db = getDatabase(env)
-        const task = createRestoreTask(taskId, backupData)
 
-        await saveRestoreTask(db, taskKey, task)
-
-        const runner = runRestoreTask(env, taskKey, backupData)
-        if (typeof context.waitUntil === 'function') {
-            context.waitUntil(runner)
-        } else {
-            runner.catch((error) => {
-                console.error('Restore task failed:', error)
+        let totals
+        try {
+            totals = await storeRestoreData(db, taskId, backupData)
+        } catch (storeError) {
+            return new Response(JSON.stringify({ error: 'Failed to store restore data: ' + storeError.message }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json', ...corsHeaders }
             })
         }
+
+        const task = createRestoreTask(taskId, totals, backupData.timestamp)
+        await saveRestoreTask(db, taskKey, task)
 
         return new Response(JSON.stringify({
             success: true,
